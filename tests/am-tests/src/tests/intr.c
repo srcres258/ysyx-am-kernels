@@ -9,7 +9,9 @@ Context *simple_trap(Event ev, Context *ctx) {
     case EVENT_YIELD:
       putch('y'); break;
     default:
-      panic("Unhandled event"); break;
+      printf("Unknown event: %d\n", ev.event);
+      panic("Unhandled event");
+      break;
   }
   return ctx;
 }
@@ -20,7 +22,7 @@ void hello_intr() {
   io_read(AM_INPUT_CONFIG);
   iset(1);
   while (1) {
-    for (volatile int i = 0; i < 10000000; i++) ;
+    for (volatile int i = 0; i < 10000; i++) ;
     yield();
   }
 }
