@@ -3,7 +3,7 @@
 #include <klib.h>
 
 #define MEM_TEST_ADDR 0x80000000
-#define MEM_TEST_SIZE 0x1000
+#define MEM_TEST_SIZE 0x400000
 #define BLOCK_SIZE    0x100
 
 static bool test_u8_walking_ones(void *base) {

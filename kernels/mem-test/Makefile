@@ -1,4 +1,4 @@
 NAME = mem-test
 SRCS = mem-test.c
-CFLAGS = -DDEBUG
+CFLAGS = -DDEBUG -Oz
 include $(AM_HOME)/Makefile
