@@ -4,10 +4,6 @@
 
 // ---------------------------------------------------------------------------
 // SDRAM mem-test — 4 KB SDRAM 访存测试
-//
-// MT48LC16M16A2 颗粒: 4 bank x 8192 row x 512 col x 16 bit = 32 MB
-// 地址映射: 0xa0000000 ~ 0xa1ffffff
-// 测试首 4 KB 区域 (0xa0000000 ~ 0xa0000fff)
 // ---------------------------------------------------------------------------
 
 #define SDRAM_BASE 0xa0000000UL
@@ -21,7 +17,7 @@ enum {
 };
 
 // ---------------------------------------------------------------------------
-// 32-bit 写 + 读校验 (主测试)
+// 32-bit
 // ---------------------------------------------------------------------------
 static int test_u32_block(uintptr_t base, size_t size)
 {
@@ -29,18 +25,15 @@ static int test_u32_block(uintptr_t base, size_t size)
     size_t n = size / 4;
     size_t i;
 
-    // 写入: data = base + i*4 (地址相关模式)
     for (i = 0; i < n; i++)
         p[i] = (uint32_t)(base + i * 4);
-
-    // 读出校验
+    asm volatile("fence" ::: "memory");
     for (i = 0; i < n; i++) {
         uint32_t exp = (uint32_t)(base + i * 4);
         uint32_t got = p[i];
         if (got != exp) {
-            printf("FAIL u32 @0x%08lx: exp %08lx got %08lx\n",
-                   (unsigned long)(base + i * 4),
-                   (unsigned long)exp, (unsigned long)got);
+            int diff = (int)(exp ^ got);
+            halt(diff ? diff : HALT_U32_FAIL);
             return HALT_U32_FAIL;
         }
     }
@@ -49,7 +42,7 @@ static int test_u32_block(uintptr_t base, size_t size)
 }
 
 // ---------------------------------------------------------------------------
-// 16-bit 写 + 读校验
+// 16-bit
 // ---------------------------------------------------------------------------
 static int test_u16_block(uintptr_t base, size_t size)
 {
@@ -59,13 +52,13 @@ static int test_u16_block(uintptr_t base, size_t size)
 
     for (i = 0; i < n; i++)
         p[i] = (uint16_t)((base + i * 2) & 0xffff);
-
+    asm volatile("fence" ::: "memory");
     for (i = 0; i < n; i++) {
         uint16_t exp = (uint16_t)((base + i * 2) & 0xffff);
         uint16_t got = p[i];
         if (got != exp) {
-            printf("FAIL u16 @0x%08lx: exp %04x got %04x\n",
-                   (unsigned long)(base + i * 2), exp, got);
+            int diff = (int)(exp ^ got);
+            halt(diff ? diff : HALT_U16_FAIL);
             return HALT_U16_FAIL;
         }
     }
@@ -74,7 +67,7 @@ static int test_u16_block(uintptr_t base, size_t size)
 }
 
 // ---------------------------------------------------------------------------
-// 8-bit 写 + 读校验
+// 8-bit
 // ---------------------------------------------------------------------------
 static int test_u8_block(uintptr_t base, size_t size)
 {
@@ -83,13 +76,13 @@ static int test_u8_block(uintptr_t base, size_t size)
 
     for (i = 0; i < size; i++)
         p[i] = (uint8_t)((base + i) & 0xff);
-
+    asm volatile("fence" ::: "memory");
     for (i = 0; i < size; i++) {
         uint8_t exp = (uint8_t)((base + i) & 0xff);
         uint8_t got = p[i];
         if (got != exp) {
-            printf("FAIL u8 @0x%08lx: exp %02x got %02x\n",
-                   (unsigned long)(base + i), exp, got);
+            int diff = (int)(exp ^ got);
+            halt(diff ? diff : HALT_U8_FAIL);
             return HALT_U8_FAIL;
         }
     }
@@ -109,23 +102,16 @@ int main(const char *mainargs)
            (unsigned long)base,
            (unsigned long)(base + TEST_SIZE - 1),
            (unsigned long)(TEST_SIZE / 1024));
+    printf("Total length: %lu bytes\n", (unsigned long)TEST_SIZE);
 
     ret = test_u32_block(base, TEST_SIZE);
     if (ret != HALT_OK) halt(ret);
 
-    // Note: 16-bit and 8-bit tests may fail due to a pre-existing
-    // APB bridge byte-lane issue (unrelated to SDRAM model).
-    // The 32-bit test above validates the SDRAM implementation.
     ret = test_u16_block(base, TEST_SIZE);
-    if (ret != HALT_OK) {
-        printf("  (u16/u8 known APB bridge issue, not SDRAM model)\n");
-        // Continue to halt with success — 32-bit already passed
-    }
+    if (ret != HALT_OK) halt(ret);
 
     ret = test_u8_block(base, TEST_SIZE);
-    if (ret != HALT_OK) {
-        printf("  (u16/u8 known APB bridge issue, not SDRAM model)\n");
-    }
+    if (ret != HALT_OK) halt(ret);
 
     printf("SDRAM mem-test: ALL TESTS PASSED\n");
     halt(HALT_OK);
