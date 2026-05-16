@@ -1,45 +1,46 @@
 /*
- * SDRAM 完整访存测试 (mem-test)
+ * SDRAM 完整访存测试 (mem-test) v2 — 支持动态配置
  *
- * 测试对象: MT48LC16M16A2 SDRAM 颗粒 (32 MB)
- *   地址范围: 0xa0000000 ~ 0xa1ffffff
- *   容量: 4 bank x 8192 row x 512 col x 16 bit = 256 Mbit = 32 MB
- *   耗时: ~1 小时 (Verilator 仿真环境)
+ * 测试对象: MT48LC16M16A2 SDRAM 颗粒
+ *   1颗粒 (无扩展):     32MB,  addr: 0xa0000000 ~ 0xa1ffffff
+ *   2颗粒 (位扩展):     64MB,  addr: 0xa0000000 ~ 0xa3ffffff
+ *   4颗粒 (位+字扩展):  128MB, addr: 0xa0000000 ~ 0xa7ffffff
  *
  * 测试方法 (ysyx B2 阶段 1.8 节):
  *   1. 多宽度: 8 / 16 / 32 / 64-bit, 数据模式 data = addr & width_mask
  *   2. 两趟法: 全写 -> fence 写屏障 -> 全读校验
- *   3. 1 MB 分块 (共 32 块), 每块完成后 printf 进度
+ *   3. 1 MB 分块, 每块完成后输出进度
  *   4. 首/中/尾块额外执行 allbits / checkerboard / ones_zeros 诊断
  *
  * CLINT 重叠处理:
  *   地址 0xa0000048 ~ 0xa000004f 为 CLINT mtime 寄存器,
  *   与 SDRAM 地址空间重叠, 由 CPU 核心通过 DPI-C 内部拦截,
  *   不会到达 SDRAM 控制器. 测试时跳过该 8 字节范围.
+ *
+ * mainargs 格式: "BIT=1 WORD=1"
+ *   BIT:  0 = 16-bit single,   1 = 32-bit bit-extension  (default: 1)
+ *   WORD: 0 = single channel,  1 = word-extension       (default: 1)
+ *
+ * 注意:
+ *   AM klib 的 printf 在 RV32E 上对 %2d / %08lx / %02x 等带宽度/补零的
+ *   格式说明符有已知问题, 会输出错误数字. 本代码完全避免使用 printf 的
+ *   数字格式化功能, 改用 putch / puts 组合输出.
  */
 
 #include <stdint.h>
 #include <am.h>
 #include <klib.h>
+#include <klib-macros.h>
 
-#define SDRAM_BASE      0xa0000000UL
-#define SDRAM_SIZE      (32UL * 1024 * 1024)
-#define BLOCK_SIZE      (1UL  * 1024 * 1024)
-#define BLOCK_COUNT     (SDRAM_SIZE / BLOCK_SIZE)
+#define SDRAM_BASE          0xa0000000UL
+#define BLOCK_SIZE          (1UL * 1024 * 1024)
+#define CLINT_ADDR          0xa0000048UL
+#define CLINT_SIZE          8UL
+#define PROGRESS_STEP       (4096UL)
+#define PROGRESS_DOTS_WRAP  64
 
-#define CLINT_ADDR      0xa0000048UL
-#define CLINT_SIZE      8UL
-
-#define WORDS_PER_BLOCK (BLOCK_SIZE / 4)
-#define DIAG_BLOCK(b)   ((b) == 0 || (b) == BLOCK_COUNT / 2 || (b) == (int)(BLOCK_COUNT - 1))
-
-/*
- * PROGRESS_STEP: bytes between two progress dots (".").
- * With 1 MB blocks: 4 KB = 256 dots per pass, ~1 dot / second in simulation.
- * Adjust to taste — e.g. 65536 (64 KB) for sparser output.
- */
-#define PROGRESS_STEP      (4096UL)
-#define PROGRESS_DOTS_WRAP 64
+static size_t sdram_size;
+static int    block_count;
 
 enum {
     HALT_OK        = 0,
@@ -52,7 +53,11 @@ enum {
     HALT_ONES      = 7,
 };
 
-/** Check whether [addr, addr + byte_len) overlaps CLINT mtime registers. */
+static inline int diag_block(int b)
+{
+    return b == 0 || b == block_count / 2 || b == block_count - 1;
+}
+
 static inline int clint_overlap(uintptr_t addr, size_t byte_len)
 {
     uintptr_t end = addr + byte_len;
@@ -61,9 +66,9 @@ static inline int clint_overlap(uintptr_t addr, size_t byte_len)
 
 static inline void progress_dot(int *pline)
 {
-    printf(".");
+    putch('.');
     if (++(*pline) >= PROGRESS_DOTS_WRAP) {
-        printf("\n      ");
+        putstr("\n      ");
         *pline = 0;
     }
 }
@@ -76,9 +81,88 @@ static inline void progress_dot(int *pline)
     }                                                      \
 } while (0)
 
+static void print_hex_nibbles(unsigned int value, int nibbles)
+{
+    int shift;
+    for (shift = (nibbles - 1) * 4; shift >= 0; shift -= 4)
+        putch("0123456789abcdef"[(value >> shift) & 0xf]);
+}
+
+static void print_small_int(int value)
+{
+    if (value >= 100)
+        putch('0' + value / 100);
+    if (value >= 10)
+        putch('0' + (value / 10) % 10);
+    putch('0' + value % 10);
+}
+
+static int parse_keyval(const char *str, const char *key, int *val_out)
+{
+    while (*str) {
+        while (*str == ' ' || *str == '\t')
+            str++;
+        if (!*str)
+            break;
+
+        const char *k = key;
+        while (*k && *str == *k) {
+            str++;
+            k++;
+        }
+        if (*k != '\0') {
+            while (*str && *str != ' ' && *str != '\t')
+                str++;
+            continue;
+        }
+
+        if (*str != '=')
+            return 0;
+        str++;
+
+        int value = 0;
+        while (*str >= '0' && *str <= '9') {
+            value = value * 10 + (*str - '0');
+            str++;
+        }
+        *val_out = value;
+        return 1;
+    }
+    return 0;
+}
+
+static void parse_mainargs(const char *mainargs,
+                           int *bit_ext, int *word_ext)
+{
+    *bit_ext  = 1;
+    *word_ext = 1;
+
+    if (!mainargs || !*mainargs)
+        return;
+
+    parse_keyval(mainargs, "BIT",  bit_ext);
+    parse_keyval(mainargs, "WORD", word_ext);
+
+    if (!*bit_ext && *word_ext) {
+        putstr("WARNING: BIT=0 WORD=1 invalid, "
+             "falling back to WORD=0\n");
+        *word_ext = 0;
+    }
+}
+
+static void compute_sdram_size(int bit_ext, int word_ext)
+{
+    sdram_size  = 32UL * 1024 * 1024;
+    if (bit_ext)  sdram_size *= 2;
+    if (word_ext) sdram_size *= 2;
+    block_count = (int)(sdram_size / BLOCK_SIZE);
+}
+
+/* ------------------------------------------------------------ */
+
 static void test_u8_block(uintptr_t base, size_t size)
 {
-    volatile uint8_t *p = (volatile uint8_t *)base;
+    volatile uint8_t *ptr = (volatile uint8_t *)base;
     size_t bytes_done = 0, next_dot = PROGRESS_STEP;
     int pline = 0;
     size_t i;
@@ -86,20 +170,27 @@ static void test_u8_block(uintptr_t base, size_t size)
     for (i = 0; i < size; i++) {
         uintptr_t addr = base + i;
         if (!clint_overlap(addr, 1))
-            p[i] = (uint8_t)(addr & 0xff);
+            ptr[i] = (uint8_t)(addr & 0xff);
         PROGRESS_MAYBE(1, bytes_done, next_dot, &pline);
     }
     asm volatile("fence" ::: "memory");
 
     for (i = 0; i < size; i++) {
         uintptr_t addr = base + i;
-        if (clint_overlap(addr, 1))
-            { PROGRESS_MAYBE(1, bytes_done, next_dot, &pline); continue; }
-        uint8_t exp = (uint8_t)(addr & 0xff);
-        uint8_t got = p[i];
-        if (got != exp) {
-            printf("\nFAIL u8 @0x%08lx: exp %02x got %02x (xor=%02x)\n",
-                   (unsigned long)addr, exp, got, exp ^ got);
+        if (clint_overlap(addr, 1)) {
+            PROGRESS_MAYBE(1, bytes_done, next_dot, &pline);
+            continue;
+        }
+        uint8_t expected = (uint8_t)(addr & 0xff);
+        uint8_t got      = ptr[i];
+        if (got != expected) {
+            putstr("\nFAIL u8 @");
+            print_hex_nibbles((unsigned int)addr, 8);
+            putstr(" exp=");
+            print_hex_nibbles(expected, 2);
+            putstr(" got=");
+            print_hex_nibbles(got, 2);
+            putch('\n');
             halt(HALT_U8_FAIL);
         }
         PROGRESS_MAYBE(1, bytes_done, next_dot, &pline);
@@ -108,29 +199,36 @@ static void test_u8_block(uintptr_t base, size_t size)
 
 static void test_u16_block(uintptr_t base, size_t size)
 {
-    volatile uint16_t *p = (volatile uint16_t *)base;
-    size_t n = size / 2;
+    volatile uint16_t *ptr = (volatile uint16_t *)base;
+    size_t count = size / 2;
     size_t bytes_done = 0, next_dot = PROGRESS_STEP;
     int pline = 0;
     size_t i;
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 2;
         if (!clint_overlap(addr, 2))
-            p[i] = (uint16_t)(addr & 0xffff);
+            ptr[i] = (uint16_t)(addr & 0xffff);
         PROGRESS_MAYBE(2, bytes_done, next_dot, &pline);
     }
     asm volatile("fence" ::: "memory");
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 2;
-        if (clint_overlap(addr, 2))
-            { PROGRESS_MAYBE(2, bytes_done, next_dot, &pline); continue; }
-        uint16_t exp = (uint16_t)(addr & 0xffff);
-        uint16_t got = p[i];
-        if (got != exp) {
-            printf("\nFAIL u16 @0x%08lx: exp %04x got %04x (xor=%04x)\n",
-                   (unsigned long)addr, exp, got, exp ^ got);
+        if (clint_overlap(addr, 2)) {
+            PROGRESS_MAYBE(2, bytes_done, next_dot, &pline);
+            continue;
+        }
+        uint16_t expected = (uint16_t)(addr & 0xffff);
+        uint16_t got      = ptr[i];
+        if (got != expected) {
+            putstr("\nFAIL u16 @");
+            print_hex_nibbles((unsigned int)addr, 8);
+            putstr(" exp=");
+            print_hex_nibbles(expected, 4);
+            putstr(" got=");
+            print_hex_nibbles(got, 4);
+            putch('\n');
             halt(HALT_U16_FAIL);
         }
         PROGRESS_MAYBE(2, bytes_done, next_dot, &pline);
@@ -139,31 +237,36 @@ static void test_u16_block(uintptr_t base, size_t size)
 
 static void test_u32_block(uintptr_t base, size_t size)
 {
-    volatile uint32_t *p = (volatile uint32_t *)base;
-    size_t n = size / 4;
+    volatile uint32_t *ptr = (volatile uint32_t *)base;
+    size_t count = size / 4;
     size_t bytes_done = 0, next_dot = PROGRESS_STEP;
     int pline = 0;
     size_t i;
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 4;
         if (!clint_overlap(addr, 4))
-            p[i] = (uint32_t)addr;
+            ptr[i] = (uint32_t)addr;
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
     }
     asm volatile("fence" ::: "memory");
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 4;
-        if (clint_overlap(addr, 4))
-            { PROGRESS_MAYBE(4, bytes_done, next_dot, &pline); continue; }
-        uint32_t exp = (uint32_t)addr;
-        uint32_t got = p[i];
-        if (got != exp) {
-            printf("\nFAIL u32 @0x%08lx: exp %08lx got %08lx (xor=%08lx)\n",
-                   (unsigned long)addr,
-                   (unsigned long)exp, (unsigned long)got,
-                   (unsigned long)(exp ^ got));
+        if (clint_overlap(addr, 4)) {
+            PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
+            continue;
+        }
+        uint32_t expected = (uint32_t)addr;
+        uint32_t got      = ptr[i];
+        if (got != expected) {
+            putstr("\nFAIL u32 @");
+            print_hex_nibbles((unsigned int)addr, 8);
+            putstr(" exp=");
+            print_hex_nibbles(expected, 8);
+            putstr(" got=");
+            print_hex_nibbles(got, 8);
+            putch('\n');
             halt(HALT_U32_FAIL);
         }
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
@@ -179,165 +282,191 @@ static void test_u32_block(uintptr_t base, size_t size)
  */
 static void test_u64_block(uintptr_t base, size_t size)
 {
-    volatile uint64_t *p = (volatile uint64_t *)base;
-    size_t n = size / 8;
+    volatile uint64_t *ptr = (volatile uint64_t *)base;
+    size_t count = size / 8;
     size_t bytes_done = 0, next_dot = PROGRESS_STEP;
     int pline = 0;
     size_t i;
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 8;
         if (!clint_overlap(addr, 8))
-            p[i] = (uint64_t)addr;
+            ptr[i] = (uint64_t)addr;
         PROGRESS_MAYBE(8, bytes_done, next_dot, &pline);
     }
     asm volatile("fence" ::: "memory");
 
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 8;
-        if (clint_overlap(addr, 8))
-            { PROGRESS_MAYBE(8, bytes_done, next_dot, &pline); continue; }
-        uint64_t exp = (uint64_t)addr;
-        uint64_t got = p[i];
-        if (got != exp) {
-            printf("\nFAIL u64 @0x%08lx: "
-                   "exp %08lx_%08lx got %08lx_%08lx\n",
-                   (unsigned long)addr,
-                   (unsigned long)((uint32_t)(exp >> 32)),
-                   (unsigned long)((uint32_t)exp),
-                   (unsigned long)((uint32_t)(got >> 32)),
-                   (unsigned long)((uint32_t)got));
+        if (clint_overlap(addr, 8)) {
+            PROGRESS_MAYBE(8, bytes_done, next_dot, &pline);
+            continue;
+        }
+        uint64_t expected = (uint64_t)addr;
+        uint64_t got      = ptr[i];
+        if (got != expected) {
+            putstr("\nFAIL u64 @");
+            print_hex_nibbles((unsigned int)addr, 8);
+            putch('\n');
             halt(HALT_U64_FAIL);
         }
         PROGRESS_MAYBE(8, bytes_done, next_dot, &pline);
     }
 }
 
-static void test_u32_allbits(volatile uint32_t *p)
+/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
+
+static void test_u32_allbits(volatile uint32_t *ptr)
 {
     uint32_t val = 1;
     int i;
 
-    for (i = 0; i < 32; i++) { p[i] = val; val <<= 1; }
-    p[32] = 0x55555555;
-    p[33] = 0xAAAAAAAA;
-    p[34] = 0xFFFFFFFF;
-    p[35] = 0x00000000;
+    for (i = 0; i < 32; i++) {
+        ptr[i] = val;
+        val <<= 1;
+    }
+    ptr[32] = 0x55555555;
+    ptr[33] = 0xAAAAAAAA;
+    ptr[34] = 0xFFFFFFFF;
+    ptr[35] = 0x00000000;
 
     asm volatile("fence" ::: "memory");
 
     val = 1;
     for (i = 0; i < 32; i++) {
-        if (p[i] != val) {
-            printf("FAIL allbits[%d]: exp %08lx got %08lx\n",
-                   i, (unsigned long)val, (unsigned long)p[i]);
+        if (ptr[i] != val) {
+            putstr("FAIL allbits\n");
             halt(HALT_ALLBITS);
         }
         val <<= 1;
     }
-    if (p[32] != 0x55555555) printf("FAIL allbits[32]\n"), halt(HALT_ALLBITS);
-    if (p[33] != 0xAAAAAAAA) printf("FAIL allbits[33]\n"), halt(HALT_ALLBITS);
-    if (p[34] != 0xFFFFFFFF) printf("FAIL allbits[34]\n"), halt(HALT_ALLBITS);
-    if (p[35] != 0x00000000) printf("FAIL allbits[35]\n"), halt(HALT_ALLBITS);
+    if (ptr[32] != 0x55555555) { putstr("FAIL allbits[32]\n"); halt(HALT_ALLBITS); }
+    if (ptr[33] != 0xAAAAAAAA) { putstr("FAIL allbits[33]\n"); halt(HALT_ALLBITS); }
+    if (ptr[34] != 0xFFFFFFFF) { putstr("FAIL allbits[34]\n"); halt(HALT_ALLBITS); }
+    if (ptr[35] != 0x00000000) { putstr("FAIL allbits[35]\n"); halt(HALT_ALLBITS); }
 }
 
-static void test_u32_checkerboard(volatile uint32_t *p, int n)
+static void test_u32_checkerboard(volatile uint32_t *ptr, int count)
 {
     size_t bytes_done = 0, next_dot = PROGRESS_STEP;
     int pline = 0;
     int i;
 
-    for (i = 0; i < n; i++) {
-        p[i] = (i & 1) ? 0xAAAAAAAA : 0x55555555;
+    for (i = 0; i < count; i++) {
+        ptr[i] = (i & 1) ? 0xAAAAAAAA : 0x55555555;
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
     }
-
     asm volatile("fence" ::: "memory");
 
-    for (i = 0; i < n; i++) {
-        uint32_t exp = (uint32_t)((i & 1) ? 0xAAAAAAAA : 0x55555555);
-        if (p[i] != exp) {
-            printf("\nFAIL checker[%d]: exp %08lx got %08lx\n",
-                   i, (unsigned long)exp, (unsigned long)p[i]);
+    for (i = 0; i < count; i++) {
+        uint32_t expected = (uint32_t)((i & 1) ? 0xAAAAAAAA : 0x55555555);
+        if (ptr[i] != expected) {
+            putstr("\nFAIL checker\n");
             halt(HALT_CHECKER);
         }
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
     }
 }
 
-static void test_u32_ones_zeros(volatile uint32_t *p, int n)
+static void test_u32_ones_zeros(volatile uint32_t *ptr, int count)
 {
     size_t bytes_done = 0, next_dot = PROGRESS_STEP;
     int pline = 0;
     int i;
 
-    for (i = 0; i < n; i++) p[i] = 0xFFFFFFFF;
+    for (i = 0; i < count; i++)
+        ptr[i] = 0xFFFFFFFF;
     asm volatile("fence" ::: "memory");
-    for (i = 0; i < n; i++) {
-        if (p[i] != 0xFFFFFFFF) {
-            printf("\nFAIL ones[%d]: got %08lx\n", i, (unsigned long)p[i]);
+    for (i = 0; i < count; i++) {
+        if (ptr[i] != 0xFFFFFFFF) {
+            putstr("\nFAIL ones\n");
             halt(HALT_ONES);
         }
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
     }
 
     bytes_done = 0;
-    next_dot = PROGRESS_STEP;
-    pline = 0;
+    next_dot   = PROGRESS_STEP;
+    pline      = 0;
 
-    for (i = 0; i < n; i++) p[i] = 0x00000000;
+    for (i = 0; i < count; i++)
+        ptr[i] = 0x00000000;
     asm volatile("fence" ::: "memory");
-    for (i = 0; i < n; i++) {
-        if (p[i] != 0x00000000) {
-            printf("\nFAIL zeros[%d]: got %08lx\n", i, (unsigned long)p[i]);
+    for (i = 0; i < count; i++) {
+        if (ptr[i] != 0x00000000) {
+            putstr("\nFAIL zeros\n");
             halt(HALT_ONES);
         }
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
     }
 }
 
+/* ================================================================== */
+
 int main(const char *mainargs)
 {
+    int bit_ext, word_ext;
     int blk;
 
-    (void)mainargs;
+    parse_mainargs(mainargs, &bit_ext, &word_ext);
+    compute_sdram_size(bit_ext, word_ext);
 
-    printf("========================================\n");
-    printf("SDRAM mem-test: %lu MB total, 1 MB/block\n",
-           (unsigned long)(SDRAM_SIZE / (1024 * 1024)));
-    printf("CLINT mtime @0x%08lx (skip %lu bytes)\n",
-           (unsigned long)CLINT_ADDR, (unsigned long)CLINT_SIZE);
-    printf("========================================\n");
+    putstr("========================================\n");
+    putstr("SDRAM mem-test v2\n");
+    putstr("  BIT=");
+    putch('0' + bit_ext);
+    putstr("  WORD=");
+    putch('0' + word_ext);
+    putstr("\n  Blocks: ");
+    print_small_int(block_count);
+    putstr("\n  Base: a0000000\n");
+    putstr("========================================\n");
 
-    for (blk = 0; blk < (int)BLOCK_COUNT; blk++) {
+    for (blk = 0; blk < block_count; blk++) {
         uintptr_t base = SDRAM_BASE + (uintptr_t)blk * BLOCK_SIZE;
 
-        printf("Block %2d/%2d [0x%08lx-0x%08lx]\n",
-               blk + 1, (int)BLOCK_COUNT,
-               (unsigned long)base,
-               (unsigned long)(base + BLOCK_SIZE - 1));
+        putstr("B");
+        print_small_int(blk + 1);
+        putstr("/");
+        print_small_int(block_count);
+        putstr(" u8 ");
+        test_u8_block(base, BLOCK_SIZE);
+        putstr("OK\n");
 
-        printf("  u8  "); test_u8_block(base, BLOCK_SIZE);  printf(" PASS\n");
-        printf("  u16 "); test_u16_block(base, BLOCK_SIZE); printf(" PASS\n");
-        printf("  u32 "); test_u32_block(base, BLOCK_SIZE); printf(" PASS\n");
-        printf("  u64 "); test_u64_block(base, BLOCK_SIZE); printf(" PASS\n");
+        putstr("    u16 ");
+        test_u16_block(base, BLOCK_SIZE);
+        putstr("OK\n");
 
-        if (DIAG_BLOCK(blk)) {
+        putstr("    u32 ");
+        test_u32_block(base, BLOCK_SIZE);
+        putstr("OK\n");
+
+        putstr("    u64 ");
+        test_u64_block(base, BLOCK_SIZE);
+        putstr("OK\n");
+
+        if (diag_block(blk)) {
             volatile uint32_t *p32 = (volatile uint32_t *)base;
-            printf("  allbits    "); test_u32_allbits(p32);
-            printf(" PASS\n");
-            printf("  checker    "); test_u32_checkerboard(p32, (int)WORDS_PER_BLOCK);
-            printf(" PASS\n");
-            printf("  ones_zeros "); test_u32_ones_zeros(p32, (int)WORDS_PER_BLOCK);
-            printf(" PASS\n");
+
+            putstr("    allbits    ");
+            test_u32_allbits(p32);
+            putstr("OK\n");
+
+            putstr("    checker    ");
+            test_u32_checkerboard(p32, (int)(BLOCK_SIZE / 4));
+            putstr("OK\n");
+
+            putstr("    ones_zeros ");
+            test_u32_ones_zeros(p32, (int)(BLOCK_SIZE / 4));
+            putstr("OK\n");
         }
 
-        printf("  => BLOCK PASS\n");
+        putstr("    => BLOCK PASS\n");
     }
 
-    printf("========================================\n");
-    printf("SDRAM mem-test: ALL %d BLOCKS PASSED\n", (int)BLOCK_COUNT);
-    printf("========================================\n");
+    putstr("========================================\n");
+    putstr("SDRAM mem-test v2: ALL BLOCKS PASSED\n");
+    putstr("========================================\n");
     halt(HALT_OK);
     return 0;
 }
