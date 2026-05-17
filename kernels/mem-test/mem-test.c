@@ -188,7 +188,7 @@ static void test_u8_block(uintptr_t base, size_t size)
         }
         PROGRESS_MAYBE(1, bytes_done, next_dot, &pline);
     }
-    asm volatile("fence" ::: "memory");
+    /* barrier: drain write pipeline */ { volatile uint8_t *__b = (volatile uint8_t *)base; (void)__b[0]; (void)__b[PROGRESS_STEP]; (void)__b[2*PROGRESS_STEP]; }
 
     for (i = 0; i < size; i++) {
         uintptr_t addr = base + i;
