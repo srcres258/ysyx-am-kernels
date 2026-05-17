@@ -171,6 +171,21 @@ static void test_u8_block(uintptr_t base, size_t size)
         uintptr_t addr = base + i;
         if (!clint_overlap(addr, 1))
             ptr[i] = (uint8_t)(addr & 0xff);
+        /* spot-check first byte of every 4KB chunk */
+        if ((i & 0xFFF) == 0 && !clint_overlap(base + i, 1)) {
+            uint8_t v = ptr[i];
+            uint8_t e = (uint8_t)((base + i) & 0xff);
+            if (v != e) {
+                putstr("\nFAIL u8 @w-");
+                print_hex_nibbles((unsigned int)(base + i), 8);
+                putstr(" exp=");
+                print_hex_nibbles(e, 2);
+                putstr(" got=");
+                print_hex_nibbles(v, 2);
+                putch('\n');
+                halt(HALT_U8_FAIL);
+            }
+        }
         PROGRESS_MAYBE(1, bytes_done, next_dot, &pline);
     }
     asm volatile("fence" ::: "memory");
@@ -421,6 +436,37 @@ int main(const char *mainargs)
     print_small_int(block_count);
     putstr("\n  Base: a0000000\n");
     putstr("========================================\n");
+
+    /* pre-flight diagnostic */
+    {
+        volatile uint32_t *diag = (volatile uint32_t *)SDRAM_BASE;
+        putstr("DIAG: wr 0xA5A5A5A5 @ a0000000... ");
+        diag[0] = 0xA5A5A5A5;
+        asm volatile("fence" ::: "memory");
+        uint32_t dg = diag[0];
+        if (dg != 0xA5A5A5A5) {
+            putstr("FAIL got=");
+            print_hex_nibbles(dg, 8);
+            putstr("\n");
+            halt(HALT_U32_FAIL);
+        }
+        putstr("OK\nDIAG: wr 0x5A @ a0000000 (byte0)... ");
+        volatile uint8_t *db = (volatile uint8_t *)SDRAM_BASE;
+        db[0] = 0x5A;
+        asm volatile("fence" ::: "memory");
+        uint8_t dgb = db[0];
+        if (dgb != 0x5A) {
+            putstr("FAIL got=");
+            print_hex_nibbles(dgb, 2);
+            putstr("\n");
+            halt(HALT_U8_FAIL);
+        }
+        putstr("OK\n");
+        /* restore to 0 */
+        db[0] = 0x00;
+        diag[0] = 0x00000000;
+        asm volatile("fence" ::: "memory");
+    }
 
     for (blk = 0; blk < block_count; blk++) {
         uintptr_t base = SDRAM_BASE + (uintptr_t)blk * BLOCK_SIZE;
