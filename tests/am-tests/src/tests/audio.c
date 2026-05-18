@@ -8,11 +8,11 @@ void audio_test() {
 
   io_write(AM_AUDIO_CTRL, 44100, 1, 2048);
 
-  extern uint8_t audio_payload, audio_payload_end;
+  extern const uint8_t audio_payload, audio_payload_end;
   uint32_t audio_len = &audio_payload_end - &audio_payload;
   int nplay = 0;
   Area sbuf;
-  sbuf.start = &audio_payload;
+  sbuf.start = (void *)&audio_payload;
   while (nplay < audio_len) {
     int len = (audio_len - nplay > 4096 ? 4096 : audio_len - nplay);
     sbuf.end = sbuf.start + len;

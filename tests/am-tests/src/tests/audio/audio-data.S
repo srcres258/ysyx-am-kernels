@@ -1,4 +1,4 @@
-.section .data
+.section .rodata
 .global audio_payload, audio_payload_end
 .p2align 3
 audio_payload:
