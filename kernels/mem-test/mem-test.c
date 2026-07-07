@@ -18,6 +18,7 @@
  *   不会到达 SDRAM 控制器. 测试时跳过该 8 字节范围.
  *
  * mainargs 格式: "BIT=1 WORD=1"
+ * 兼容旧写法:   "bit_ext=1 word_ext=1"
  *   BIT:  0 = 16-bit single,   1 = 32-bit bit-extension  (default: 1)
  *   WORD: 0 = single channel,  1 = word-extension       (default: 1)
  *
@@ -88,6 +89,17 @@ static void print_hex_nibbles(unsigned int value, int nibbles)
         putch("0123456789abcdef"[(value >> shift) & 0xf]);
 }
 
+static void print_hex_u64(uint64_t value)
+{
+    print_hex_nibbles((unsigned int)(value >> 32), 8);
+    print_hex_nibbles((unsigned int)(value & 0xffffffffu), 8);
+}
+
+static inline void mem_barrier(void)
+{
+    asm volatile("fence iorw, iorw" ::: "memory");
+}
+
 static void print_small_int(int value)
 {
     if (value >= 100)
@@ -134,14 +146,23 @@ static int parse_keyval(const char *str, const char *key, int *val_out)
 static void parse_mainargs(const char *mainargs,
                            int *bit_ext, int *word_ext)
 {
+    int bit_found = 0;
+    int word_found = 0;
+
     *bit_ext  = 1;
     *word_ext = 1;
 
     if (!mainargs || !*mainargs)
         return;
 
-    parse_keyval(mainargs, "BIT",  bit_ext);
-    parse_keyval(mainargs, "WORD", word_ext);
+    bit_found  = parse_keyval(mainargs, "BIT", bit_ext) ||
+                 parse_keyval(mainargs, "bit_ext", bit_ext);
+    word_found = parse_keyval(mainargs, "WORD", word_ext) ||
+                 parse_keyval(mainargs, "word_ext", word_ext);
+
+    if (!bit_found && !word_found) {
+        putstr("WARNING: unrecognized mainargs, use BIT=/WORD=\n");
+    }
 
     if (!*bit_ext && *word_ext) {
         putstr("WARNING: BIT=0 WORD=1 invalid, "
@@ -188,7 +209,10 @@ static void test_u8_block(uintptr_t base, size_t size)
         }
         PROGRESS_MAYBE(1, bytes_done, next_dot, &pline);
     }
-    /* barrier: drain write pipeline */ { volatile uint8_t *__b = (volatile uint8_t *)base; (void)__b[0]; (void)__b[PROGRESS_STEP]; (void)__b[2*PROGRESS_STEP]; }
+    mem_barrier();
+    bytes_done = 0;
+    next_dot = PROGRESS_STEP;
+    pline = 0;
 
     for (i = 0; i < size; i++) {
         uintptr_t addr = base + i;
@@ -226,7 +250,10 @@ static void test_u16_block(uintptr_t base, size_t size)
             ptr[i] = (uint16_t)(addr & 0xffff);
         PROGRESS_MAYBE(2, bytes_done, next_dot, &pline);
     }
-    asm volatile("fence" ::: "memory");
+    mem_barrier();
+    bytes_done = 0;
+    next_dot = PROGRESS_STEP;
+    pline = 0;
 
     for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 2;
@@ -264,7 +291,10 @@ static void test_u32_block(uintptr_t base, size_t size)
             ptr[i] = (uint32_t)addr;
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
     }
-    asm volatile("fence" ::: "memory");
+    mem_barrier();
+    bytes_done = 0;
+    next_dot = PROGRESS_STEP;
+    pline = 0;
 
     for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 4;
@@ -309,7 +339,10 @@ static void test_u64_block(uintptr_t base, size_t size)
             ptr[i] = (uint64_t)addr;
         PROGRESS_MAYBE(8, bytes_done, next_dot, &pline);
     }
-    asm volatile("fence" ::: "memory");
+    mem_barrier();
+    bytes_done = 0;
+    next_dot = PROGRESS_STEP;
+    pline = 0;
 
     for (i = 0; i < count; i++) {
         uintptr_t addr = base + i * 8;
@@ -322,6 +355,10 @@ static void test_u64_block(uintptr_t base, size_t size)
         if (got != expected) {
             putstr("\nFAIL u64 @");
             print_hex_nibbles((unsigned int)addr, 8);
+            putstr(" exp=");
+            print_hex_u64(expected);
+            putstr(" got=");
+            print_hex_u64(got);
             putch('\n');
             halt(HALT_U64_FAIL);
         }
@@ -345,7 +382,7 @@ static void test_u32_allbits(volatile uint32_t *ptr)
     ptr[34] = 0xFFFFFFFF;
     ptr[35] = 0x00000000;
 
-    asm volatile("fence" ::: "memory");
+    mem_barrier();
 
     val = 1;
     for (i = 0; i < 32; i++) {
@@ -371,7 +408,7 @@ static void test_u32_checkerboard(volatile uint32_t *ptr, int count)
         ptr[i] = (i & 1) ? 0xAAAAAAAA : 0x55555555;
         PROGRESS_MAYBE(4, bytes_done, next_dot, &pline);
     }
-    asm volatile("fence" ::: "memory");
+    mem_barrier();
 
     for (i = 0; i < count; i++) {
         uint32_t expected = (uint32_t)((i & 1) ? 0xAAAAAAAA : 0x55555555);
@@ -391,7 +428,7 @@ static void test_u32_ones_zeros(volatile uint32_t *ptr, int count)
 
     for (i = 0; i < count; i++)
         ptr[i] = 0xFFFFFFFF;
-    asm volatile("fence" ::: "memory");
+    mem_barrier();
     for (i = 0; i < count; i++) {
         if (ptr[i] != 0xFFFFFFFF) {
             putstr("\nFAIL ones\n");
@@ -406,7 +443,7 @@ static void test_u32_ones_zeros(volatile uint32_t *ptr, int count)
 
     for (i = 0; i < count; i++)
         ptr[i] = 0x00000000;
-    asm volatile("fence" ::: "memory");
+    mem_barrier();
     for (i = 0; i < count; i++) {
         if (ptr[i] != 0x00000000) {
             putstr("\nFAIL zeros\n");
@@ -442,7 +479,7 @@ int main(const char *mainargs)
         volatile uint32_t *diag = (volatile uint32_t *)SDRAM_BASE;
         putstr("DIAG: wr 0xA5A5A5A5 @ a0000000... ");
         diag[0] = 0xA5A5A5A5;
-        asm volatile("fence" ::: "memory");
+        mem_barrier();
         uint32_t dg = diag[0];
         if (dg != 0xA5A5A5A5) {
             putstr("FAIL got=");
@@ -453,7 +490,7 @@ int main(const char *mainargs)
         putstr("OK\nDIAG: wr 0x5A @ a0000000 (byte0)... ");
         volatile uint8_t *db = (volatile uint8_t *)SDRAM_BASE;
         db[0] = 0x5A;
-        asm volatile("fence" ::: "memory");
+        mem_barrier();
         uint8_t dgb = db[0];
         if (dgb != 0x5A) {
             putstr("FAIL got=");
@@ -465,7 +502,7 @@ int main(const char *mainargs)
         /* restore to 0 */
         db[0] = 0x00;
         diag[0] = 0x00000000;
-        asm volatile("fence" ::: "memory");
+        mem_barrier();
     }
 
     for (blk = 0; blk < block_count; blk++) {
